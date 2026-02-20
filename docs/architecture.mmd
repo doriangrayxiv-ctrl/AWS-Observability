@@ -1,0 +1,178 @@
+%% =================================================================
+%% Brighton Collectibles — Centralized Observability Architecture
+%% =================================================================
+%%
+%% Stack
+%%   Collection   : otelcol-contrib  (OpenTelemetry Collector Contrib)
+%%   Metrics      : Prometheus         ← prometheusremotewrite exporter
+%%   Logs         : Grafana Loki       ← loki exporter  (or otlphttp)
+%%   Traces       : Grafana Tempo      ← otlp gRPC exporter
+%%   Presentation : Grafana            (self-managed, AWS us-west-2)
+%%
+%% Default pattern : Local otelcol-contrib agent on each host
+%% Exceptions      : EKS → DaemonSet + cluster Deployment
+%%                   ECS Fargate → Sidecar container
+%%                   Lambda → OTel Lambda Layer + CloudWatch
+%%                   Managed DBs (RDS) → CloudWatch → Gateway Collector
+%% =================================================================
+
+flowchart TD
+
+    %% ── EXTERNAL / SAAS SOURCES ────────────────────────────
+    subgraph saas["External SaaS"]
+        shopify(["Shopify · Ecommerce"])
+        pos(["Retail POS · REST API"])
+        snowflake[("Snowflake\nData Warehouse")]
+    end
+
+    %% ── ON-PREMISES DATA CENTER ────────────────────────────
+    subgraph onprem["On-Premises Data Center"]
+        pg_op[("PostgreSQL")]
+        my_op[("MySQL")]
+        host_op["Linux / Windows Hosts"]
+        otel_op{{"otelcol-contrib · Local Agent\nhostmetricsreceiver\npostgresqlreceiver · mysqlreceiver\nfilelogreceiver"}}
+        pg_op --> otel_op
+        my_op --> otel_op
+        host_op --> otel_op
+    end
+
+    %% ── DIGITALOCEAN ───────────────────────────────────────
+    subgraph do_env["DigitalOcean"]
+        do_jobs["Scheduled Jobs\n(Python)"]
+        otel_do{{"otelcol-contrib · Local Agent\nhostmetricsreceiver\nfilelogreceiver · otlpreceiver"}}
+        do_jobs --> otel_do
+    end
+
+    %% ── AWS us-west-2 ──────────────────────────────────────
+    subgraph aws["AWS us-west-2"]
+
+        %% ── VPN Termination ────────────────────────────────
+        vpn{{"VPN Gateway\nDirect Connect / WireGuard\nTLS-encrypted"}}
+
+        %% ── EKS Cluster ───────────────────────────────────
+        subgraph eks["EKS Cluster"]
+            eks_apps["Application Pods\n(auto-instrumented via\nOTel SDK / operator)"]
+            otel_eks_ds{{"otelcol-contrib\nDaemonSet · per node\nkubeletstatsreceiver\nfilelogreceiver · otlpreceiver\nhostmetricsreceiver"}}
+            otel_eks_dep{{"otelcol-contrib\nDeployment · 1 replica\nk8sclusterreceiver\nk8seventsreceiver"}}
+            eks_apps -->|"OTLP + pod logs"| otel_eks_ds
+        end
+
+        %% ── ECS Fargate ───────────────────────────────────
+        subgraph ecs["ECS Fargate Tasks"]
+            ecs_app["App Containers"]
+            otel_ecs{{"otelcol-contrib · Sidecar\nawsecscontainermetricsreceiver\notlpreceiver · filelogreceiver"}}
+            ecs_app -->|"OTLP + stdout"| otel_ecs
+        end
+
+        %% ── EC2 Instances ─────────────────────────────────
+        subgraph ec2["EC2 Instances"]
+            intranet["Intranet\n(JS / PHP)"]
+            b2b["B2B Website\n(JS / PHP)"]
+            etl["ETL Pipelines\n(Python)"]
+            sched["Scheduled Jobs\n(Python)"]
+            otel_ec2{{"otelcol-contrib · Local Agent\nhostmetricsreceiver\nfilelogreceiver · otlpreceiver"}}
+            intranet & b2b & etl & sched --> otel_ec2
+        end
+
+        %% ── Lambda ────────────────────────────────────────
+        lambda["AWS Lambda\nFunctions"]
+        otel_lyr["OTel Lambda Layer\n(traces + metrics via OTLP)"]
+        lambda -->|"auto-instrument"| otel_lyr
+
+        %% ── Managed Services ──────────────────────────────
+        rds[("RDS · MySQL")]
+        cw["Amazon CloudWatch\nMetrics + Logs"]
+        rds -->|"native metrics\n+ slow-query logs"| cw
+        lambda -->|"stdout / stderr\n→ CW Logs"| cw
+
+        %% ── Gateway Collector ─────────────────────────────
+        otel_gw{{"otelcol-contrib · Gateway\nawscloudwatchreceiver\nhttpreceiver · otlpreceiver\nsnowflakereceiver"}}
+        cw -->|"pull metrics & logs"| otel_gw
+        otel_lyr -->|"OTLP push\n(traces + metrics)"| otel_gw
+
+        %% ── OBSERVABILITY PLATFORM ────────────────────────
+        subgraph obs["Grafana Observability Platform · self-managed"]
+            prometheus[("Prometheus\nMetrics Store\n90-day retention")]
+            loki[("Grafana Loki\nLog Store\n90-day retention")]
+            tempo[("Grafana Tempo\nTrace Store\n90-day retention")]
+            grafana["Grafana\nDashboards · Alerts · Explore\nSelf-Service · RBAC"]
+            prometheus -. "data source" .-> grafana
+            loki -. "data source" .-> grafana
+            tempo -. "data source" .-> grafana
+        end
+
+        %% ── Export: AWS collectors → backends ─────────────
+        %% Metrics  → prometheusremotewrite exporter → Prometheus
+        %% Logs     → loki exporter                  → Grafana Loki
+        %% Traces   → otlp gRPC exporter             → Grafana Tempo
+        otel_eks_ds  --> prometheus & loki & tempo
+        otel_eks_dep --> prometheus & loki
+        otel_ecs     --> prometheus & loki & tempo
+        otel_ec2     --> prometheus & loki & tempo
+        otel_gw      --> prometheus & loki & tempo
+
+        %% ── Export: VPN → backends ────────────────────────
+        vpn --> prometheus & loki & tempo
+    end
+
+    %% ── Cross-environment connectivity ─────────────────────
+    otel_op -->|"over VPN / Direct Connect"| vpn
+    otel_do -->|"over site-to-site VPN"| vpn
+
+    %% ── SaaS → Gateway Collector ──────────────────────────
+    shopify -->|"Webhooks / API polling"| otel_gw
+    pos -->|"httpreceiver / API polling"| otel_gw
+    snowflake -->|"snowflakereceiver"| otel_gw
+
+    %% ── Alerting Outputs ──────────────────────────────────
+    alerts["Alerting Targets\nEmail · Slack · PagerDuty\nOpsGenie · Webhooks"]
+    grafana -->|"Grafana Unified Alerting"| alerts
+
+    %% ── Styles ────────────────────────────────────────────
+    classDef collector   fill:#2d6a4f,stroke:#1b4332,stroke-width:2px,color:#fff
+    classDef backend     fill:#1d3557,stroke:#0d1b2a,stroke-width:2px,color:#fff
+    classDef grafNode    fill:#e76f00,stroke:#c25700,stroke-width:2px,color:#fff
+    classDef vpnNode     fill:#7b2cbf,stroke:#5a189a,stroke-width:2px,color:#fff
+    classDef alertNode   fill:#d62828,stroke:#9d0208,stroke-width:2px,color:#fff
+    classDef lambdaLayer fill:#3a7d44,stroke:#2d6a4f,stroke-width:2px,color:#fff
+
+    class otel_op,otel_do,otel_eks_ds,otel_eks_dep,otel_ecs,otel_ec2,otel_gw collector
+    class otel_lyr lambdaLayer
+    class prometheus,loki,tempo backend
+    class grafana grafNode
+    class vpn vpnNode
+    class alerts alertNode
+
+%% =================================================================
+%% VALIDATION NOTES  (see assessment in accompanying message)
+%% =================================================================
+%% HIGH CONFIDENCE
+%%   - EKS DaemonSet + cluster Deployment pattern (industry standard)
+%%   - ECS Fargate sidecar (only viable pattern; no host access)
+%%   - EC2 / on-prem / DigitalOcean local agent (per-host install)
+%%   - Lambda Layer → Gateway Collector (traces/metrics via OTLP)
+%%   - Lambda logs → CloudWatch Logs → Gateway Collector
+%%   - RDS → CloudWatch → Gateway Collector (no agent on managed DB)
+%%   - VPN / Direct Connect for on-prem + DigitalOcean connectivity
+%%   - Prometheus remote-write, Loki exporter, Tempo OTLP exports
+%%   - Grafana as single pane for Prometheus + Loki + Tempo
+%%   - awsecscontainermetricsreceiver for Fargate task metrics
+%%   - kubeletstatsreceiver + k8sclusterreceiver for EKS
+%%   - postgresqlreceiver + mysqlreceiver for on-prem DBs
+%%
+%% MEDIUM CONFIDENCE
+%%   - snowflakereceiver — exists in otelcol-contrib; verify
+%%     maturity and supported metric sets for your Snowflake plan
+%%   - awscloudwatchreceiver pulling BOTH metrics and logs from CW;
+%%     CloudWatch Logs may require a subscription filter → Firehose
+%%     → awsfirehosereceiver path for higher-volume log streams
+%%   - k8seventsreceiver routing to Loki — works, but verify the
+%%     event-to-log mapping meets your schema needs
+%%
+%% LOWER CONFIDENCE (custom integration required)
+%%   - Shopify integration: no native OTel receiver exists; requires
+%%     a custom polling microservice or Shopify webhook → httpreceiver
+%%   - Retail POS REST API: generic API; requires custom polling
+%%     script or httpreceiver webhook; exact approach depends on
+%%     the POS vendor's API capabilities
+%% =================================================================
