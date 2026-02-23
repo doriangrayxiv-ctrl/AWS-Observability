@@ -1,20 +1,23 @@
 # GitHub Copilot Instructions
 
 ## Purpose
-- Provide repository-specific guidance so all Copilot agents produce artifacts aligned with Brighton Collectibles' chosen observability stack and project goals.
+- Provide repository-specific guidance so all Copilot agents produce artifacts aligned with the company's chosen observability stack and project goals.
+
+## Workspace Restrictions
+- The `~local/` directory and any paths under it are **off limits** for agent use. Do not read, reference, or generate content from `~local/` unless the user has explicitly referenced it or a specific path within it in their request.
 
 ## Scope
 - Covers architecture, configuration, scripting, documentation, and rollout planning for the centralized observability platform.
 - Intended audience: DevOps engineers and Copilot agents generating code, IaC, diagrams, and written deliverables.
 
 ## Project Objective
-- Design and implement a **cost-effective, centralized observability platform** that unifies **metrics, logs, and traces** across all Brighton Collectibles systems.
+- Design and implement a **cost-effective, centralized observability platform** that unifies **metrics, logs, and traces** across all company systems.
 - The platform must enable **self-service dashboards and alerting** and provide application- and infrastructure-level health awareness.
 - Reference `original.md` for the full exercise brief, constraints, and deliverables.
 
 ## Chosen Technology Stack
 
-All generated artifacts, configs, and recommendations **must** target this stack:
+All generated artifacts and recommendations **must** target this stack:
 
 | Pillar | Technology | Notes |
 |--------|-----------|-------|
@@ -82,20 +85,14 @@ When generating configs or architecture references, account for these systems:
 2. **Written Rationale (2–3 paragraphs)** — justify the stack choice, assumptions, minimal-change approach, and how logs + metrics + traces are handled.
 3. **Rollout Plan / Project Phasing** — phased approach; first 2–4 weeks deliver quick value, later phases expand coverage.
 
-## Prompt Examples (aligned to stack)
-- "Generate an OTel Collector Contrib agent config (`otelcol-contrib.yaml`) for an EKS DaemonSet that exports metrics, logs, and traces via TLS OTLP to the Gateway NLB endpoint."
-- "Generate an OTel Gateway Collector config (`gateway.yaml`) that receives OTLP from agents, applies tail-sampling and PII scrubbing, and exports to Prometheus remote-write, Loki, and Tempo."
-- "Write Terraform for an AWS ASG + NLB running otelcol-contrib Gateway nodes, with a target-tracking scaling policy based on CPU."
-- "Write a `docker-compose.yml` for local testing with otelcol-contrib (agent + gateway), Prometheus, Loki, Tempo, and a Grafana instance simulating Managed Grafana."
-- "Create a phased rollout plan (weeks 1–4, 5–8, 9–12) for deploying OTel Collectors across AWS, on-prem, and DigitalOcean, with Gateway ASG stood up in week 1."
-- "Draft a 2–3 paragraph rationale for choosing AWS Managed Grafana + OTel Gateway pattern over Datadog/Splunk for a mixed AWS/on-prem/DO environment."
-- "Generate a Grafana dashboard JSON for visualizing OTel Gateway health (queue length, export errors, spans/metrics/logs received and exported, ASG instance count)."
-- "Write an ALB listener rule (Terraform) that enforces OIDC auth before forwarding to AWS Managed Grafana, with WAF WebACL attached."
+## Scope of Agent Output
+- **Configuration files, IaC, and code samples are out of scope** unless the user explicitly requests them.
+- Default outputs are architecture descriptions, written rationale, diagrams (Mermaid or text-based), rollout plans, and documentation.
+- When the user does ask for a config or code artifact, it must conform to the stack defined above.
 
 ## Verification & Follow-ups
-- After generating content, validate: correct OTel Collector component names (receivers, processors, exporters), security posture, credential handling, and cost assumptions.
-- Ensure all configs reference `otelcol-contrib` (not the core distribution) since contrib includes the required receivers.
-- Ask for a test plan for any generated scripts or IaC.
+- After generating content, validate: alignment with the chosen stack, security posture, and cost assumptions.
+- If configs or IaC are generated at user request, ensure they reference `otelcol-contrib` (not the core distribution) and ask for a test plan.
 
 ## Contacts / Notes
 - Reference `original.md` for the full exercise constraints and deliverables.

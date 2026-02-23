@@ -1,12 +1,13 @@
 # OTel Collection — Endpoint Architecture
 
-Defines how `otelcol-contrib` is deployed and configured across each collection scenario. All agents forward telemetry via TLS OTLP to the Gateway NLB at `nlb.company.com:443`. Processing — including tail sampling, PII scrubbing, deduplication, and filtering — is applied at the agent before data leaves the host.
+Defines how `otelcol-contrib` is deployed and configured across each collection scenario. All agents forward telemetry via TLS OTLP to the Gateway NLB at `nlb.company.com:443`. Agents perform **lightweight processing only** — PII scrubbing, deduplication, filtering, and batching — before data leaves the host. **Tail sampling is performed exclusively at the Gateway tier**, where the complete trace can be assembled from all contributing agents before a sampling decision is made.
 
 ---
 
-## OTel Agent
+## Common Components
 
-Deploys `otelcol-contrib` as a managed process directly on each host or a dedicated instance. The agent handles local collection and in-process telemetry processing before forwarding to the Gateway NLB via TLS OTLP.
+Shared pipeline configuration applied across all `otelcol-contrib` agent and sidecar deployments. The processor ordering, enrichment rules, and TLS exporter settings defined here are applied by every agent and sidecar section below before telemetry is forwarded to the Gateway NLB at `nlb.company.com:443`.
+
 
 ---
 
@@ -14,12 +15,15 @@ Deploys `otelcol-contrib` as a managed process directly on each host or a dedica
 
 All agent deployments run the following processor stages in the collector pipeline before export. Processor configs are rendered from templates and deployed alongside receiver/exporter configs through the same DevOps pipeline.
 
-#### Tail Sampling
+#### Tail Sampling (Gateway tier only)
 
-- Implemented via `tailsamplingprocessor`.
-- Sampling decisions are made after a configurable wait window (e.g., 10–30s) once the full trace is assembled locally.
+> **Tail sampling does not run on agents.** A single agent only sees the spans it locally collected and cannot make trace-complete sampling decisions. Tail sampling is applied at the **OTel Gateway Collectors**, where the full trace is assembled from all contributing agents before a sampling decision is made.
+
+- Implemented via `tailsamplingprocessor` on **Gateway Collector instances only**.
+- Sampling decisions are made after a configurable wait window (e.g., 10–30s) once the full trace is assembled at the Gateway.
 - Policies are defined per service: always-sample on errors and slow spans; probabilistic rate on healthy traces.
 - Reduces trace volume forwarded to Tempo without losing signal on anomalous requests.
+- Agent configurations do **not** include `tailsamplingprocessor`; agents forward all spans unsampled to the Gateway.
 
 #### PII Scrubbing
 
@@ -42,6 +46,26 @@ All agent deployments run the following processor stages in the collector pipeli
   - **Metrics**: drop high-cardinality or unused metric names defined in a blocklist.
   - **Traces**: drop health-check and synthetic monitor spans (matched by `http.target` or `http.url` patterns).
 - Filter rules are environment-aware (e.g., DEBUG logs retained in staging, dropped in prod) via pipeline-injected variables.
+
+### Common Processor Stack
+
+All `otelcol-contrib` agent and sidecar deployments share the following six-processor pipeline. Per-deployment sections below list only **additions to or exclusions from** this stack.
+
+| Component | Purpose |
+|-----------|---------|
+| `memorylimiterprocessor` | Prevent OOM if ingest spikes beyond local buffer capacity |
+| `batchprocessor` | Batch spans/metrics/logs before export to reduce NLB connections |
+| `resourcedetectionprocessor` | Auto-attach cloud/host metadata (instance ID, region, AZ, hostname — or ECS task ARN / K8s node name depending on environment) |
+| `attributesprocessor` | Attach static labels: `env`, `service.name`, `team` (from config template vars or task definition env vars) |
+| `redactionprocessor` | PII scrubbing — block-listed attribute keys replaced with a redacted placeholder before export |
+| `filterprocessor` | Drop debug logs (prod), unused metrics, health-check/readiness-probe spans, and duplicate records per environment rules |
+
+---
+
+## Agent Deployments
+
+Persistent `otelcol-contrib` processes deployed on each host, node, or dedicated EC2 instance. All agent deployments apply the [Common Processor Stack](#common-processor-stack) and forward telemetry via TLS OTLP to the Gateway NLB. No tail sampling occurs at the agent — all spans are forwarded unsampled for Gateway-tier decisions.
+
 
 ---
 
@@ -81,14 +105,8 @@ Configurations are **templated and deployed via DevOps pipelines** (e.g., Ansibl
 
 ##### Processors
 
-| Component | Purpose |
-|-----------|---------|
-| `memorylimiterprocessor` | Prevent OOM if ingest spikes beyond local buffer capacity |
-| `batchprocessor` | Batch spans/metrics/logs before export to reduce NLB connections |
-| `resourcedetectionprocessor` | Auto-attach cloud metadata (instance ID, region, AZ, hostname) |
-| `attributesprocessor` | Attach static labels: `env`, `service.name`, `team` (from config template vars) || `tailsamplingprocessor` | Tail-based trace sampling — always-sample on errors/slow spans; probabilistic on healthy traces |
-| `redactionprocessor` | PII scrubbing — block-listed attribute keys replaced with redacted placeholder before export |
-| `filterprocessor` | Drop debug logs, unused metrics, health-check spans, and duplicate log records per environment rules |
+All six components from the [Common Processor Stack](#common-processor-stack) — no additions or exclusions for this deployment.
+
 ##### Exporters
 
 | Component | Purpose |
@@ -128,7 +146,7 @@ Configurations are **templated and deployed via DevOps pipelines** (e.g., Ansibl
 
 ---
 
-### EC2 — Remote Collection Instance (Dedicated Scraper)
+### EC2 — Remote Collection Scraper (Dedicated Instance)
 
 A single dedicated EC2 instance (`t3.medium` or similar) running `otelcol-contrib` configured exclusively to pull telemetry from **external and managed services** that cannot host their own agent. This instance has no local application workload.
 
@@ -138,8 +156,8 @@ A single dedicated EC2 instance (`t3.medium` or similar) running `otelcol-contri
 
 | System | Collection Method | Signal Types |
 |--------|------------------|-------------|
-| Shopify (Ecommerce SaaS) | Webhook receiver — Shopify pushes order/event data to `httpreceiver` | Logs · Metrics |
-| Retail POS (REST API) | `httpreceiver` webhook inbound or scripted `httpcheck`/custom poller | Logs · Metrics |
+| Shopify (Ecommerce SaaS) | Webhook receiver — Shopify pushes order/event data to `httplogreceiver` | Logs · Metrics |
+| Retail POS (REST API) | `httplogreceiver` webhook inbound (if POS supports webhooks); Python cron script → `filelogreceiver` for pull-only APIs | Logs · Metrics |
 | AWS RDS (MySQL) | `awscloudwatchreceiver` (native RDS metrics + slow-query logs from CW Logs) | Logs · Metrics |
 | Snowflake (Data Warehouse) | `snowflakereceiver` (Snowflake REST API / information_schema queries) | Metrics |
 | AWS CloudWatch | `awscloudwatchreceiver` (pull metrics + log groups from CW) | Logs · Metrics |
@@ -147,15 +165,15 @@ A single dedicated EC2 instance (`t3.medium` or similar) running `otelcol-contri
 #### Receiver Detail
 
 ##### Shopify
-- Shopify does not expose a native OTel endpoint. The recommended path is a **Shopify webhook** configured to POST order/event payloads to an `httpreceiver` listener on this instance.
-- The `httpreceiver` accepts inbound HTTP POST, parses the JSON payload, and emits log records.
-- An alternative is a lightweight polling script that calls the Shopify Admin REST API and writes OTLP metrics to a local `otlpreceiver`.
+- Shopify does not expose a native OTel endpoint. The recommended path is a **Shopify webhook** configured to POST order/event payloads to an `httplogreceiver` listener on this instance.
+- The `httplogreceiver` accepts inbound HTTP POST bodies and emits one log record per payload; no custom parsing code required in the collector.
+- Fallback (if webhooks cannot be used): a Python script on cron calls the Shopify Admin REST API, appends newline-delimited JSON records to `/var/otel/shopify_events.ndjson`, and `filelogreceiver` tails that file.
 - **Credential**: Shopify Webhook HMAC secret stored in AWS Secrets Manager; mounted as env var.
 
 ##### Retail POS (REST API)
-- If the POS system supports webhooks: configure the POS to push events to an `httpreceiver` endpoint on this instance.
-- If the POS is pull-only: a custom polling sidecar script (Python) calls the POS REST API and emits metrics/logs via the OTel Python SDK to the local `otlpreceiver`.
-- Exact receiver choice depends on POS vendor capability — to be confirmed.
+- If the POS system supports webhooks: configure the POS to push events to an `httplogreceiver` endpoint on this instance.
+- If the POS is pull-only: a Python script on cron calls the POS REST API and appends newline-delimited JSON records to `/var/otel/pos_events.ndjson`; `filelogreceiver` tails that file and emits log records into the pipeline.
+- Exact collection method depends on POS vendor capability — webhook preferred; cron poller as fallback.
 - **Credential**: POS API key stored in AWS Secrets Manager.
 
 ##### AWS RDS
@@ -182,20 +200,16 @@ A single dedicated EC2 instance (`t3.medium` or similar) running `otelcol-contri
 
 | Component | Purpose |
 |-----------|---------|
-| `httpreceiver` | Inbound webhook payloads (Shopify, POS) |
-| `otlpreceiver` | Metrics/logs from local poller scripts (POS custom, Shopify alternative) |
+| `httplogreceiver` | Inbound webhook payloads (Shopify, POS) — emits one log record per HTTP POST body |
+| `filelogreceiver` | Tails NDJSON output files written by Python cron pollers (POS pull-only, Shopify fallback) |
+| `otlpreceiver` | Reserved for any future SDK-instrumented local processes |
 | `awscloudwatchreceiver` | Pull metrics + logs from Amazon CloudWatch (RDS, Lambda, general AWS) |
 | `snowflakereceiver` | Pull Snowflake account usage metrics |
 
 ##### Processors
 
-| Component | Purpose |
-|-----------|---------|
-| `memorylimiterprocessor` | Guard against polling bursts |
-| `batchprocessor` | Batch before forwarding to Gateway |
-| `resourcedetectionprocessor` | Attach EC2 instance metadata |
-| `attributesprocessor` | Attach `service.name`, `source.system` labels per pipeline || `redactionprocessor` | PII scrubbing — strip sensitive fields from webhook payloads before export |
-| `filterprocessor` | Drop redundant or low-value records (e.g., duplicate poll responses, noisy API events) |
+All six components from the [Common Processor Stack](#common-processor-stack). The `attributesprocessor` additionally attaches a `source.system` label (e.g., `shopify`, `rds`, `snowflake`) via config template vars to identify the originating system on every record.
+
 ##### Exporters
 
 | Component | Purpose |
@@ -206,14 +220,374 @@ A single dedicated EC2 instance (`t3.medium` or similar) running `otelcol-contri
 
 - IAM Instance Profile on this EC2 grants scoped CloudWatch read permissions — no long-lived AWS keys needed.
 - All other secrets (Snowflake, POS API key, Shopify HMAC) are fetched at startup from **AWS Secrets Manager** via the `env` provider or a startup script.
-- Security Group restricts inbound ports (6060, 6061) to known source IP ranges (Shopify IP ranges, POS datacenter IPs).
+- Security Group restricts inbound `httplogreceiver` webhook ports to known source IP ranges (Shopify IP ranges, POS datacenter IPs). Specific port assignments are defined during detailed config — out of scope for this high-level design.
 - No inbound SSH; use AWS SSM Session Manager for access.
 
 ---
 
-## OTel Instrumentation
+### EKS DaemonSet
 
-Used where deploying a standalone `otelcol-contrib` agent process is impractical or unnecessary — specifically for short-lived Python scripts that run as scheduled jobs. Rather than standing up a persistent collector, the Python script is **wrapped by the OTel auto-instrumentation entry point**, which injects collection at process startup with no code changes to the script itself.
+The primary collection method for AWS EKS workloads. `otelcol-contrib` is deployed as a Kubernetes **DaemonSet**, placing one collector pod on every node in the cluster. This mirrors the EC2 host agent pattern at the node level and provides automatic coverage for all pods running on a node without requiring per-pod configuration changes.
+
+An optional **per-pod sidecar** supplements the DaemonSet for workloads requiring pod-level processing isolation. It is not the default and should not be deployed cluster-wide.
+
+---
+
+#### Covered Systems
+
+| System | Hosting | Signal Types |
+|--------|---------|-------------|
+| Application pods | AWS EKS (all node types) | Logs · Traces · Metrics |
+| Kubernetes cluster state | AWS EKS | Metrics |
+
+---
+
+#### DaemonSet vs. Sidecar — Decision Rule
+
+| Pattern | When to Use |
+|---------|-------------|
+| **DaemonSet only** | Default for all workloads. App pods push OTLP to the node-local DaemonSet collector via the node's host IP. |
+| **DaemonSet + Sidecar** | Workloads requiring pod-level processing isolation, or where routing OTLP through a shared node collector is unacceptable for security or compliance reasons. |
+
+Do not deploy sidecars cluster-wide — DaemonSet coverage is sufficient for the vast majority of services and reduces resource and operational overhead significantly.
+
+---
+
+#### Telemetry Flow
+
+```
+┌─── EKS Node ──────────────────────────────────────────────────────────┐
+│                                                                        │
+│  ┌─── Pod A ────────────────┐    ┌─── Pod B (isolated) ─────────────┐ │
+│  │  App Container           │    │  App Container                   │ │
+│  │  (OTel SDK / auto-instr) │    │  (OTel SDK / auto-instr)         │ │
+│  │                          │    │  ┌───────────────────────────┐   │ │
+│  │  Traces/Metrics → OTLP   │    │  │  otelcol-contrib Sidecar  │   │ │
+│  │  Logs    → stdout        │    │  │  (optional, per-pod)      │   │ │
+│  └──────────┬───────────────┘    │  │  receives on localhost:   │   │ │
+│             │ OTLP               │  │  4317, forwards to        │   │ │
+│             │ hostIP:4317        │  │  DaemonSet or Gateway NLB │   │ │
+│             │                    │  └─────────────┬─────────────┘   │ │
+│             │                    └────────────────┼─────────────────┘ │
+│             │                                     │ TLS OTLP          │
+│             └─────────────────────┬───────────────┘                   │
+│                                   ▼                                   │
+│              ┌────────────────────────────────────────────────────┐   │
+│              │            otelcol-contrib DaemonSet Pod           │   │
+│              │                                                    │   │
+│              │  otlpreceiver        ◄── OTLP from app pods        │   │
+│              │  hostmetricsreceiver ◄── Node OS (CPU/mem/disk)    │   │
+│              │  kubeletstatsreceiver◄── Per-pod/container metrics │   │
+│              │  k8sclusterreceiver  ◄── Cluster state (1 pod)     │   │
+│              │  filelogreceiver     ◄── /var/log/pods/**/*.log    │   │
+│              │                                                    │   │
+│              │  k8sattributesprocessor  (pod/ns/deployment labels)│   │
+│              │  resourcedetectionprocessor (EC2 node metadata)    │   │
+│              │  attributesprocessor     (env, team, cluster.name) │   │
+│              │  redactionprocessor      (PII scrub)               │   │
+│              │  filterprocessor         (debug logs, healthchecks)│   │
+│              │  memorylimiterprocessor + batchprocessor           │   │
+│              └───────────────────────┬────────────────────────────┘   │
+└──────────────────────────────────────┼────────────────────────────────┘
+                                       │ TLS OTLP gRPC
+                                       ▼
+                           nlb.company.com:443
+                           (Gateway NLB → ASG)
+                                       │
+               ┌───────────────────────┼────────────────────┐
+               ▼                       ▼                     ▼
+          Prometheus                  Loki                 Tempo
+          (metrics)                  (logs)               (traces)
+               └───────────────────────┴─────────────────────┘
+                                       ▼
+                           grafana.company.com:443
+                           (WAF → ALB OIDC → Managed Grafana)
+```
+
+---
+
+#### Signal Flow Detail
+
+##### Metrics
+
+| Source | Receiver | What Is Captured |
+|--------|----------|-----------------|
+| Node OS | `hostmetricsreceiver` | CPU, memory, disk I/O, network I/O — same scrape set as EC2 host agent |
+| Kubelet stats | `kubeletstatsreceiver` | Per-pod and per-container CPU, memory, network, filesystem — pulled from the Kubelet `/stats/summary` endpoint on each node |
+| Cluster state | `k8sclusterreceiver` | Deployment replica counts, pod phase counts, node conditions, HPA state — **runs on one DaemonSet pod only**, elected via a `k8sleaderelector` extension to prevent duplicate cluster-level metrics |
+| App OTel SDK | `otlpreceiver` | Custom business and runtime metrics emitted by instrumented pods; received on `hostIP:4317` |
+
+All metrics → `DaemonSet → Gateway NLB → Prometheus remote-write`.
+
+##### Logs
+
+| Source | Receiver | What Is Captured |
+|--------|----------|-----------------|
+| Pod stdout/stderr | `filelogreceiver` | Tails `/var/log/pods/*/*/*.log` mounted from the node's filesystem via `hostPath`; covers all containers on the node automatically |
+| Node system logs | `filelogreceiver` | `/var/log/messages` or `/var/log/syslog` depending on node OS |
+
+The `filelogreceiver` operators parse the Kubernetes container log wrapper format (JSON with `log`, `time`, `stream` fields) to extract the inner log body. `k8sattributesprocessor` enriches every log record with `k8s.namespace.name`, `k8s.pod.name`, `k8s.container.name`, and `k8s.deployment.name` by correlating the file path against the Kubernetes API.
+
+All logs → `DaemonSet → Gateway NLB → Grafana Loki`.
+
+##### Traces
+
+| Source | Receiver | What Is Captured |
+|--------|----------|-----------------|
+| App pods (SDK / auto-instr) | `otlpreceiver` | Spans pushed from app containers to the node's host IP on port 4317; pod resolves the address via the Kubernetes Downward API (see below) |
+| Optional sidecar | `otlpreceiver` | For isolated pods: sidecar receives on `localhost:4317`, applies pod-level processing, then forwards to the DaemonSet or directly to the Gateway NLB |
+
+App pods reference the node IP at runtime using the **Kubernetes Downward API** so no hardcoded addresses or service discovery is required:
+
+```yaml
+env:
+  - name: NODE_IP
+    valueFrom:
+      fieldRef:
+        fieldPath: status.hostIP
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: "http://$(NODE_IP):4317"
+  - name: OTEL_SERVICE_NAME
+    value: "my-service"
+  - name: OTEL_RESOURCE_ATTRIBUTES
+    value: "deployment.environment=prod,team=platform"
+```
+
+> Tail sampling is **not** applied at the DaemonSet. Full trace data is forwarded to the Gateway, where tail-sampling decisions are made across the complete trace — consistent with all other agent deployments.
+
+All traces → `DaemonSet → Gateway NLB → Grafana Tempo`.
+
+---
+
+#### Custom otelcol-contrib Build — Included Components
+
+##### Receivers
+
+| Component | Purpose |
+|-----------|---------|
+| `otlpreceiver` | Receive traces and metrics from app pods via `hostIP:4317/4318` |
+| `hostmetricsreceiver` | Node OS metrics (CPU, mem, disk, net) |
+| `kubeletstatsreceiver` | Per-pod and per-container resource metrics from the Kubelet stats endpoint |
+| `k8sclusterreceiver` | Cluster-level metrics (deployments, pod phases, node conditions, HPA) — leader pod only |
+| `filelogreceiver` | Pod stdout/stderr logs from `/var/log/pods`; node system logs |
+
+##### Processors
+
+All six components from the [Common Processor Stack](#common-processor-stack), plus one EKS-specific addition:
+
+| Addition | Purpose |
+|----------|--------|
+| `k8sattributesprocessor` | Enrich spans and log records with pod, namespace, and deployment metadata via K8s API |
+
+The `resourcedetectionprocessor` is configured for EC2 node metadata (instance ID, region, AZ) and Kubernetes node name.
+
+##### Exporters
+
+| Component | Purpose |
+|-----------|------|
+| `otlpexporter` | Forward all signals (gRPC, TLS) to `nlb.company.com:443` |
+
+##### Extensions
+
+| Component | Purpose |
+|-----------|---------|
+| `healthcheckextension` | `/health` endpoint used as the DaemonSet pod liveness probe |
+| `zpagesextension` | Debug pipeline visibility during rollout |
+| `k8sleaderelector` | Elect one DaemonSet pod to run `k8sclusterreceiver`; all other pods skip it |
+
+---
+
+#### RBAC Requirements
+
+The DaemonSet ServiceAccount requires a ClusterRole so `k8sattributesprocessor` and `k8sclusterreceiver` can query the Kubernetes API server:
+
+```yaml
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+```
+
+---
+
+#### Deployment Notes
+
+- **`hostPath` mounts**: `/var/log/pods` and `/var/log` must be mounted read-only into the DaemonSet pod for `filelogreceiver` access.
+- **`hostPort`**: The `otlpreceiver` listens on `hostPort: 4317` and `hostPort: 4318` so app pods can reach it via the node IP injected by the Downward API. Using `hostNetwork: true` is an alternative but exposes broader node networking — prefer `hostPort`.
+- **Resource limits**: Set CPU `request: 100m / limit: 500m`, memory `request: 200Mi / limit: 400Mi`. Mark the pod with `priorityClassName: system-node-critical` to reduce eviction risk under node memory pressure.
+- **Config management**: Config stored in a `ConfigMap` and mounted into the DaemonSet pod. Updates are applied via `kubectl rollout restart daemonset/otelcol-contrib` from the same DevOps pipeline used for EC2 agent deployments.
+- **TLS CA cert**: Mount the Gateway NLB CA certificate into the pod from a Kubernetes `Secret` and reference it in the `otlpexporter` TLS stanza.
+- **Tolerations**: Add tolerations for control-plane node taints if node-level metrics from control plane nodes are required.
+- **Node selector**: Scope to Linux nodes only (`kubernetes.io/os: linux`) if Windows node pools are present in the cluster.
+
+---
+
+## Sidecar Deployments
+
+The primary collection method for containerized workloads running on **AWS ECS (Fargate and EC2 launch type)**. An `otelcol-contrib` container is co-deployed alongside each application container within the same ECS task, sharing the task's network namespace. This is the only viable agent pattern for Fargate, where no host OS access exists.
+
+---
+
+### How Many Sidecars?
+
+**One sidecar container per ECS task definition** — not one per cluster or per service.
+
+Because Fargate tasks are isolated at the network level, a single centralized collector cannot reach other tasks' localhost interfaces. Each task must carry its own collector sidecar to capture that task's OTLP output and container metrics. This means sidecar count scales linearly with running task count, which is expected and manageable: the sidecar is lightweight (128–256 MB RAM, minimal CPU at idle) and its resource reservation is defined in the task definition alongside the app container.
+
+For **ECS on EC2** (non-Fargate), a host-level agent (see [EC2 — Standard Host Agent](#ec2--standard-host-agent-linux--windows)) is preferred over per-task sidecars for resource efficiency. Sidecars are still valid in EC2 launch type if task-level isolation is required.
+
+---
+
+### Covered Systems
+
+| System | Hosting | Launch Type | Signal Types |
+|--------|---------|-------------|-------------|
+| Application containers | AWS ECS | Fargate | Logs · Traces · Metrics |
+| Application containers | AWS ECS | EC2 (sidecar variant) | Logs · Traces · Metrics |
+
+---
+
+### Sidecar Architecture
+
+Each ECS task definition is updated to include `otelcol-contrib` as a second container entry. The two containers share a network namespace, so the app container emits OTLP to `localhost:4317` / `localhost:4318` and the sidecar receives it without any cross-task or cross-host networking.
+
+```
+┌─── ECS Task ───────────────────────────────────────────┐
+│                                                         │
+│  ┌─────────────────────┐   OTLP (localhost:4317)       │
+│  │   App Container     │ ─────────────────────────►    │
+│  │  (your service)     │   traces · metrics · logs     │
+│  │                     │   (via OTel SDK imports)      │
+│  └─────────────────────┘                               │
+│                                                         │
+│  ┌─────────────────────┐                               │
+│  │  otelcol-contrib    │ ──► TLS OTLP ──► Gateway NLB  │
+│  │  Sidecar            │         nlb.company.com:443   │
+│  └─────────────────────┘                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+The sidecar:
+- Receives **traces, metrics, and logs** from the app container via `otlpreceiver` on `localhost:4317/4318`. All three signals share the same OTLP transport — the app uses `from opentelemetry import trace`, `metrics`, and `logs` and points its exporter at `localhost:4317`.
+- Collects ECS task-level CPU, memory, and network metrics via `awsecscontainermetricsreceiver`.
+- Applies the standard processor stack (resource detection, attribute enrichment, PII scrubbing, batching).
+- Exports all signals via TLS OTLP to the Gateway NLB.
+
+> **Note on container stdout:** App container stdout goes to CloudWatch Logs via the `awslogs` log driver — this is independent of the sidecar and is not collected by it. The sidecar receives logs exclusively via OTLP from the OTel SDK. Do not configure `filelogreceiver` pointing at `/dev/stdout` or any path derived from another container's stdout; that path is not accessible across containers in a Fargate task.
+
+---
+
+### Sidecar Container Requirements
+
+| Setting | Value |
+|---------|-------|
+| Image | `otel/opentelemetry-collector-contrib:<pinned-version>` |
+| CPU reservation | 64–128 CPU units |
+| Memory reservation | 128–256 MiB |
+| Essential | `false` — app container should not stop if collector crashes |
+| Mount | Shared config volume or baked-in config via SSM Parameter / S3 at startup |
+| Log driver | `awslogs` (sidecar's own logs → CloudWatch for operator visibility) |
+
+> **Silent failure alert — required deployment step:** Because the sidecar is non-essential, a crash leaves the task running with no telemetry collection. Deploy the EventBridge rule described in [alerting.md — A-01](alerting.md#a-01-ecs-sidecar-silent-telemetry-blackout) to detect tasks where `otelcol-contrib` has stopped but the app container remains running. Without this rule, telemetry blackouts for individual tasks are invisible to operators.
+
+---
+
+### Configuration
+
+> **Endpoint configuration is currently undefined.** The following are placeholder values pending finalization of the Gateway NLB FQDN, TLS certificate distribution approach, and ECS task IAM role permissions.
+
+Config is supplied to the sidecar at task startup via one of:
+- **S3 config fetch** — startup command pulls `s3://infra-configs/otelcol/ecs-sidecar.yaml` on init.
+- **SSM Parameter Store** — config rendered from a parameter and written to a temp file before the collector starts.
+- **Baked into image** — only appropriate for stable, environment-agnostic base configs; env-specific values injected via `OTEL_*` environment variables in the task definition.
+
+#### Receivers (sidecar build)
+
+| Component | Purpose |
+|-----------|---------|
+| `otlpreceiver` | Receive traces, metrics, and logs from app container on `localhost:4317/4318` — all three signals share this single endpoint |
+| `awsecscontainermetricsreceiver` | ECS task-level CPU, memory, network, storage metrics from the task metadata endpoint |
+
+#### Processors
+
+All six components from the [Common Processor Stack](#common-processor-stack). The `resourcedetectionprocessor` is configured to detect ECS task metadata (task ARN, cluster, region, AZ) rather than EC2 instance metadata.
+
+#### Exporters
+
+| Component | Purpose |
+|-----------|------|
+| `otlpexporter` | Forward all signals (gRPC, TLS) to Gateway NLB — **endpoint TBD** |
+
+#### App Container Instrumentation Options
+
+The sidecar is always present in every ECS task — it is the required transport layer. The choice of instrumentation approach is independent of the sidecar topology:
+
+| Approach | Code changes | Best for |
+|---|---|---|
+| **Auto-instrumentation** (`opentelemetry-instrument` wrapper) | None — prefix the container start command | Standard containers where well-known libraries (requests, SQLAlchemy, boto3, etc.) are the main observability surface |
+| **Manual OTel SDK** (`from opentelemetry import trace`, `metrics`, `logs`) | Yes — explicit SDK calls in application code | Services requiring custom spans, business-level metrics, or structured log correlation beyond auto-instrumented coverage |
+
+Either way, the app emits to `localhost:4317` → sidecar → Gateway NLB. The sidecar config is identical regardless of which instrumentation approach the application uses.
+
+---
+
+## SDK & Instrumentation Patterns
+
+Application-level instrumentation for environments where a standalone `otelcol-contrib` agent process is impractical (short-lived jobs, Lambda functions) or where SDK-level span and metric control is required. Each pattern routes telemetry to the Gateway NLB via TLS OTLP, either directly or through a co-located agent or sidecar.
+
+
+---
+
+### ETL Pipelines (Python)
+
+#### Covered Systems
+
+| System | OS | Signal Types |
+|--------|----|--------------|
+| Data/ETL Pipelines (Python) | Linux (AWS EC2) | Logs · Traces · Metrics |
+
+#### How It Works
+
+ETL pipelines run as Python processes on EC2 hosts where the [Standard Host Agent](#ec2--standard-host-agent-linux--windows) is already deployed. The **OTel Python SDK** emits traces, metrics, and logs to the local agent via `localhost:4317`; the agent applies the [common processor stack](#processing) and forwards all telemetry to the Gateway NLB via TLS OTLP. No additional agent process or infrastructure is required. Direct SDK instrumentation (explicit span boundaries per stage, custom business metrics) is preferred over the `opentelemetry-instrument` CLI wrapper for the control it provides over extract/transform/load stage boundaries.
+
+#### SDK Configuration
+
+All settings are supplied via environment variables (systemd unit env file or AWS SSM Parameter Store). The OTLP endpoint targets the **local agent**, not the Gateway NLB directly. TLS is enforced only on the agent → Gateway NLB leg.
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `OTEL_SERVICE_NAME` | `etl-<pipeline-name>` | Identifies the pipeline in Tempo and dashboards |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | Local host agent — no TLS needed on loopback |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | Transport protocol |
+| `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment=prod,team=data` | Static resource labels |
+| `OTEL_TRACES_EXPORTER` | `otlp` | Enable trace export |
+| `OTEL_METRICS_EXPORTER` | `otlp` | Enable metrics export |
+| `OTEL_LOGS_EXPORTER` | `otlp` | Enable log export |
+| `OTEL_PYTHON_LOG_CORRELATION` | `true` | Inject trace/span IDs into log records |
+
+#### Required Python Packages
+
+Installed into the pipeline's virtual environment or container image; pinned in the infrastructure repo alongside collector component versions.
+
+| Package | Purpose |
+|---------|---------|
+| `opentelemetry-api` | Public API surface for explicit span, metric, and log calls in pipeline code |
+| `opentelemetry-sdk` | Core SDK — TracerProvider, MeterProvider, LoggerProvider |
+| `opentelemetry-exporter-otlp-proto-grpc` | OTLP gRPC exporter → local host agent on `localhost:4317` |
+
+> Add library instrumentors (`opentelemetry-instrumentation-sqlalchemy`, `-psycopg2`, `-requests`, `-boto3sqs`) only if those libraries are present; call `.instrument()` manually at SDK init — **not** via the `opentelemetry-instrument` CLI wrapper.
+
+#### Deployment Notes
+
+- The Standard Host Agent must be deployed with `otlpreceiver` enabled on `localhost:4317` (included by default — no agent config changes needed).
+- Set `OTEL_*` environment variables at deploy time via the systemd unit env file or AWS SSM-injected parameters.
+- Initialize the OTel SDK at process startup, before any pipeline stage functions are called.
 
 ---
 
@@ -301,136 +675,7 @@ Installed into the job's virtual environment or container image. Pinned versions
 
 ---
 
-## OTel Sidecar
-
-The primary collection method for containerized workloads running on **AWS ECS (Fargate and EC2 launch type)**. An `otelcol-contrib` container is co-deployed alongside each application container within the same ECS task, sharing the task's network namespace. This is the only viable agent pattern for Fargate, where no host OS access exists.
-
----
-
-### How Many Sidecars?
-
-**One sidecar container per ECS task definition** — not one per cluster or per service.
-
-Because Fargate tasks are isolated at the network level, a single centralized collector cannot reach other tasks' localhost interfaces. Each task must carry its own collector sidecar to capture that task's OTLP output, stdout logs, and container metrics. This means sidecar count scales linearly with running task count, which is expected and manageable: the sidecar is lightweight (128–256 MB RAM, minimal CPU at idle) and its resource reservation is defined in the task definition alongside the app container.
-
-For **ECS on EC2** (non-Fargate), a host-level agent (see OTel Agent section) is preferred over per-task sidecars for resource efficiency. Sidecars are still valid in EC2 launch type if task-level isolation is required.
-
----
-
-### Covered Systems
-
-| System | Hosting | Launch Type | Signal Types |
-|--------|---------|-------------|-------------|
-| Application containers | AWS ECS | Fargate | Logs · Traces · Metrics |
-| Application containers | AWS ECS | EC2 (sidecar variant) | Logs · Traces · Metrics |
-
----
-
-### Sidecar Architecture
-
-Each ECS task definition is updated to include `otelcol-contrib` as a second container entry. The two containers share a network namespace, so the app container emits OTLP to `localhost:4317` / `localhost:4318` and the sidecar receives it without any cross-task or cross-host networking.
-
-```
-┌─── ECS Task ───────────────────────────────────────────┐
-│                                                         │
-│  ┌─────────────────────┐   OTLP (localhost:4317)       │
-│  │   App Container     │ ─────────────────────────►    │
-│  │  (your service)     │                               │
-│  └─────────────────────┘   stdout → FireLens / log     │
-│                             driver → sidecar filelog   │
-│  ┌─────────────────────┐                               │
-│  │  otelcol-contrib    │ ──► TLS OTLP ──► Gateway NLB  │
-│  │  Sidecar            │         nlb.company.com:443   │
-│  └─────────────────────┘                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-The sidecar:
-- Receives OTLP from the app container (traces, metrics).
-- Collects ECS container metrics via `awsecscontainermetricsreceiver`.
-- Collects container stdout/stderr logs via `filelogreceiver` (from the shared `/dev/stdout` log path or a shared volume).
-- Applies the standard processor stack (resource detection, attribute enrichment, batching).
-- Exports all signals via TLS OTLP to the Gateway NLB.
-
----
-
-### Sidecar Container Requirements
-
-| Setting | Value |
-|---------|-------|
-| Image | `otel/opentelemetry-collector-contrib:<pinned-version>` |
-| CPU reservation | 64–128 CPU units |
-| Memory reservation | 128–256 MiB |
-| Essential | `false` — app container should not stop if collector crashes |
-| Mount | Shared config volume or baked-in config via SSM Parameter / S3 at startup |
-| Log driver | `awslogs` (sidecar's own logs → CloudWatch for operator visibility) |
-
----
-
-### Configuration
-
-> **Endpoint configuration is currently undefined.** The following are placeholder values pending finalization of the Gateway NLB FQDN, TLS certificate distribution approach, and ECS task IAM role permissions.
-
-Config is supplied to the sidecar at task startup via one of:
-- **S3 config fetch** — startup command pulls `s3://infra-configs/otelcol/ecs-sidecar.yaml` on init.
-- **SSM Parameter Store** — config rendered from a parameter and written to a temp file before the collector starts.
-- **Baked into image** — only appropriate for stable, environment-agnostic base configs; env-specific values injected via `OTEL_*` environment variables in the task definition.
-
-#### Receivers (sidecar build)
-
-| Component | Purpose |
-|-----------|---------|
-| `otlpreceiver` | Receive traces and metrics from app container on `localhost:4317/4318` |
-| `awsecscontainermetricsreceiver` | ECS task-level CPU, memory, network, storage metrics from the task metadata endpoint |
-| `filelogreceiver` | Collect app container stdout/stderr logs from shared log path or volume |
-
-#### Processors
-
-| Component | Purpose |
-|-----------|---------|
-| `memorylimiterprocessor` | Protect sidecar from OOM under log/trace bursts |
-| `batchprocessor` | Batch before forwarding to reduce NLB connection overhead |
-| `resourcedetectionprocessor` | Auto-attach ECS task metadata (task ARN, cluster, region, AZ) |
-| `attributesprocessor` | Attach `service.name`, `deployment.environment` from task definition env vars |
-| `redactionprocessor` | PII scrubbing before export |
-| `filterprocessor` | Drop health-check traces, debug logs, low-value container metrics |
-
-#### Exporters
-
-| Component | Purpose |
-|-----------|------|
-| `otlpexporter` | Forward all signals (gRPC, TLS) to Gateway NLB — **endpoint TBD** |
-
----
-
-## OTel SDK
-
-A secondary, opt-in collection method for services where direct SDK integration is feasible and provides higher signal fidelity than agent-based or instrumentation-wrapper approaches. Favored when a team already owns the application code and wants explicit control over span creation, custom metrics, or structured log correlation.
-
-### When to Use
-
-- **AWS ECS Fargate** — no host access for a sidecar-less deploy; SDK emits directly to the Gateway NLB via OTLP.
-- **Python scheduled jobs** — when the `opentelemetry-instrument` wrapper is insufficient and manual span boundaries or custom metric instruments are needed.
-- Any service where auto-instrumentation coverage is inadequate for the required observability depth.
-
-### Approach
-
-The application imports the OTel SDK directly and configures an OTLP exporter pointed at the Gateway NLB. Spans, metrics, and logs are emitted in-process. No separate collector process is required on the host.
-
-SDK language packages follow the same OTLP-over-TLS transport used by all other collection methods. Endpoint and authentication settings are supplied via the standard `OTEL_*` environment variables, keeping application code environment-agnostic.
-
-### Trade-offs
-
-| | OTel SDK | OTel Agent / Instrumentation |
-|---|---|---|
-| Code changes required | Yes — explicit SDK calls | Minimal to none |
-| Custom span / metric control | Full | Limited to auto-instrumented libraries |
-| Operational overhead | Lower (no sidecar/agent process) | Higher (process to deploy and manage) |
-| Suitable for short-lived processes | Yes | Yes (instrumentation wrapper) |
-
----
-
-## ADOT Lambda Layer
+### ADOT Lambda Layer
 
 The **AWS Distro for OpenTelemetry (ADOT) Lambda Layer** is the primary collection method for AWS Lambda functions. It bundles `otelcol-contrib` and the OTel SDK into a managed Lambda Layer, automatically wrapping the function handler at runtime. No dependencies need to be added to the function's deployment package.
 
@@ -438,7 +683,7 @@ Once the layer is attached and the wrapper env var is set, the function gains fu
 
 ---
 
-### Covered Systems
+#### Covered Systems
 
 | System | Runtime | Signal Types |
 |--------|---------|--------------|
@@ -446,7 +691,7 @@ Once the layer is attached and the wrapper env var is set, the function gains fu
 
 ---
 
-### How It Works
+#### How It Works
 
 1. Attach the ADOT managed layer ARN to the Lambda function (region-specific; see [AWS ADOT Lambda docs](https://aws-otel.github.io/docs/getting-started/lambda)).
 2. Set the environment variable `AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-handler`. This tells the Lambda runtime to pass execution through the OTel wrapper before invoking the handler.
@@ -454,7 +699,7 @@ Once the layer is attached and the wrapper env var is set, the function gains fu
 4. The handler executes normally. The wrapper creates a root span for the invocation and auto-instruments supported libraries (HTTP clients, AWS SDK calls, etc.).
 5. On invocation completion, telemetry is flushed to the collector before the sandbox freezes.
 
-#### Required Environment Variables
+##### Required Environment Variables
 
 | Variable | Value |
 |----------|-------|
@@ -465,7 +710,7 @@ Once the layer is attached and the wrapper env var is set, the function gains fu
 | `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment=prod,team=<team>` |
 | `OTEL_PROPAGATORS` | `tracecontext,baggage` |
 
-#### Collector Config (`collector.yaml` bundled in deployment package)
+##### Collector Config (`collector.yaml` bundled in deployment package)
 
 By default the ADOT layer exports to AWS X-Ray. Override with a custom config to route to the Gateway NLB instead:
 
@@ -487,7 +732,7 @@ service:
 
 ---
 
-### Sending Telemetry from Lambda Code
+#### Sending Telemetry from Lambda Code
 
 The layer provides initialised SDK globals. Functions can emit custom telemetry with minimal code.
 
@@ -531,7 +776,7 @@ def handler(event, context):
 
 ---
 
-### Notes & Constraints
+#### Notes & Constraints
 
 - **Cold start overhead**: The embedded collector adds ~200–500 ms on cold start. Acceptable for most workloads; avoid for latency-critical synchronous APIs where cold starts are frequent.
 - **Flush on freeze**: The OTel SDK flushes telemetry before the sandbox freezes, but very short-lived functions should set `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` and timeout values conservatively to avoid data loss.
@@ -540,208 +785,33 @@ def handler(event, context):
 
 ---
 
-## OTel DaemonSet — AWS EKS
+### OTel SDK — Direct Instrumentation (opt-in)
 
-The primary collection method for AWS EKS workloads. `otelcol-contrib` is deployed as a Kubernetes **DaemonSet**, placing one collector pod on every node in the cluster. This mirrors the EC2 host agent pattern at the node level and provides automatic coverage for all pods running on a node without requiring per-pod configuration changes.
+An opt-in pattern for services where explicit SDK calls provide higher signal fidelity than the `opentelemetry-instrument` auto-instrumentation wrapper. Applies when manual span and metric control is warranted.
 
-An optional **per-pod sidecar** supplements the DaemonSet for workloads requiring pod-level processing isolation. It is not the default and should not be deployed cluster-wide.
+> **Fargate:** The OTel SDK is used by Fargate app containers to emit signals to the co-located sidecar at `localhost:4317`. Whether to use auto-instrumentation or manual SDK calls is a dev-side choice — both options always emit through the sidecar. See [App Container Instrumentation Options](#app-container-instrumentation-options) in the Sidecar section. This section does not affect Fargate topology.
 
----
+> **Scheduled Jobs:** The authoritative pattern for Python scheduled jobs (AWS and DigitalOcean) is the `opentelemetry-instrument` wrapper documented in [Scheduled Jobs (Python)](#scheduled-jobs-python). Use the manual SDK approach only when the wrapper cannot provide the required span granularity or custom metric instruments.
 
-### Covered Systems
+#### When to Use
 
-| System | Hosting | Signal Types |
-|--------|---------|-------------|
-| Application pods | AWS EKS (all node types) | Logs · Traces · Metrics |
-| Kubernetes cluster state | AWS EKS | Metrics |
+- Any service where `opentelemetry-instrument` auto-instrumentation coverage is insufficient for the required observability depth.
+- Services requiring explicit custom spans, business-metric instruments, or structured log correlation beyond what auto-instrumented libraries expose.
 
----
+#### Approach
 
-### DaemonSet vs. Sidecar — Decision Rule
+The application imports the OTel SDK directly and configures an OTLP exporter pointed at the local host agent (`localhost:4317`). Where no host agent is running on the host, the exporter targets the Gateway NLB directly. Spans, metrics, and logs are emitted in-process with no additional collector process required.
 
-| Pattern | When to Use |
-|---------|-------------|
-| **DaemonSet only** | Default for all workloads. App pods push OTLP to the node-local DaemonSet collector via the node's host IP. |
-| **DaemonSet + Sidecar** | Workloads requiring pod-level processing isolation, or where routing OTLP through a shared node collector is unacceptable for security or compliance reasons. |
+SDK language packages follow the same OTLP-over-TLS transport used by all other collection methods. Endpoint and authentication settings are supplied via the standard `OTEL_*` environment variables, keeping application code environment-agnostic.
 
-Do not deploy sidecars cluster-wide — DaemonSet coverage is sufficient for the vast majority of services and reduces resource and operational overhead significantly.
+#### Trade-offs
 
----
-
-### Telemetry Flow
-
-```
-┌─── EKS Node ──────────────────────────────────────────────────────────┐
-│                                                                        │
-│  ┌─── Pod A ────────────────┐    ┌─── Pod B (isolated) ─────────────┐ │
-│  │  App Container           │    │  App Container                   │ │
-│  │  (OTel SDK / auto-instr) │    │  (OTel SDK / auto-instr)         │ │
-│  │                          │    │  ┌───────────────────────────┐   │ │
-│  │  Traces/Metrics → OTLP   │    │  │  otelcol-contrib Sidecar  │   │ │
-│  │  Logs    → stdout        │    │  │  (optional, per-pod)      │   │ │
-│  └──────────┬───────────────┘    │  │  receives on localhost:   │   │ │
-│             │ OTLP               │  │  4317, forwards to        │   │ │
-│             │ hostIP:4317        │  │  DaemonSet or Gateway NLB │   │ │
-│             │                    │  └─────────────┬─────────────┘   │ │
-│             │                    └────────────────┼─────────────────┘ │
-│             │                                     │ TLS OTLP          │
-│             └─────────────────────┬───────────────┘                   │
-│                                   ▼                                   │
-│              ┌────────────────────────────────────────────────────┐   │
-│              │            otelcol-contrib DaemonSet Pod           │   │
-│              │                                                    │   │
-│              │  otlpreceiver        ◄── OTLP from app pods        │   │
-│              │  hostmetricsreceiver ◄── Node OS (CPU/mem/disk)    │   │
-│              │  kubeletstatsreceiver◄── Per-pod/container metrics │   │
-│              │  k8sclusterreceiver  ◄── Cluster state (1 pod)     │   │
-│              │  filelogreceiver     ◄── /var/log/pods/**/*.log    │   │
-│              │                                                    │   │
-│              │  k8sattributesprocessor  (pod/ns/deployment labels)│   │
-│              │  resourcedetectionprocessor (EC2 node metadata)    │   │
-│              │  attributesprocessor     (env, team, cluster.name) │   │
-│              │  redactionprocessor      (PII scrub)               │   │
-│              │  filterprocessor         (debug logs, healthchecks)│   │
-│              │  memorylimiterprocessor + batchprocessor           │   │
-│              └───────────────────────┬────────────────────────────┘   │
-└──────────────────────────────────────┼────────────────────────────────┘
-                                       │ TLS OTLP gRPC
-                                       ▼
-                           nlb.company.com:443
-                           (Gateway NLB → ASG)
-                                       │
-               ┌───────────────────────┼────────────────────┐
-               ▼                       ▼                     ▼
-          Prometheus                  Loki                 Tempo
-          (metrics)                  (logs)               (traces)
-               └───────────────────────┴─────────────────────┘
-                                       ▼
-                           grafana.company.com:443
-                           (WAF → ALB OIDC → Managed Grafana)
-```
-
----
-
-### Signal Flow Detail
-
-#### Metrics
-
-| Source | Receiver | What Is Captured |
-|--------|----------|-----------------|
-| Node OS | `hostmetricsreceiver` | CPU, memory, disk I/O, network I/O — same scrape set as EC2 host agent |
-| Kubelet stats | `kubeletstatsreceiver` | Per-pod and per-container CPU, memory, network, filesystem — pulled from the Kubelet `/stats/summary` endpoint on each node |
-| Cluster state | `k8sclusterreceiver` | Deployment replica counts, pod phase counts, node conditions, HPA state — **runs on one DaemonSet pod only**, elected via a `k8sleaderelector` extension to prevent duplicate cluster-level metrics |
-| App OTel SDK | `otlpreceiver` | Custom business and runtime metrics emitted by instrumented pods; received on `hostIP:4317` |
-
-All metrics → `DaemonSet → Gateway NLB → Prometheus remote-write`.
-
-#### Logs
-
-| Source | Receiver | What Is Captured |
-|--------|----------|-----------------|
-| Pod stdout/stderr | `filelogreceiver` | Tails `/var/log/pods/*/*/*.log` mounted from the node's filesystem via `hostPath`; covers all containers on the node automatically |
-| Node system logs | `filelogreceiver` | `/var/log/messages` or `/var/log/syslog` depending on node OS |
-
-The `filelogreceiver` operators parse the Kubernetes container log wrapper format (JSON with `log`, `time`, `stream` fields) to extract the inner log body. `k8sattributesprocessor` enriches every log record with `k8s.namespace.name`, `k8s.pod.name`, `k8s.container.name`, and `k8s.deployment.name` by correlating the file path against the Kubernetes API.
-
-All logs → `DaemonSet → Gateway NLB → Grafana Loki`.
-
-#### Traces
-
-| Source | Receiver | What Is Captured |
-|--------|----------|-----------------|
-| App pods (SDK / auto-instr) | `otlpreceiver` | Spans pushed from app containers to the node's host IP on port 4317; pod resolves the address via the Kubernetes Downward API (see below) |
-| Optional sidecar | `otlpreceiver` | For isolated pods: sidecar receives on `localhost:4317`, applies pod-level processing, then forwards to the DaemonSet or directly to the Gateway NLB |
-
-App pods reference the node IP at runtime using the **Kubernetes Downward API** so no hardcoded addresses or service discovery is required:
-
-```yaml
-env:
-  - name: NODE_IP
-    valueFrom:
-      fieldRef:
-        fieldPath: status.hostIP
-  - name: OTEL_EXPORTER_OTLP_ENDPOINT
-    value: "http://$(NODE_IP):4317"
-  - name: OTEL_SERVICE_NAME
-    value: "my-service"
-  - name: OTEL_RESOURCE_ATTRIBUTES
-    value: "deployment.environment=prod,team=platform"
-```
-
-> Tail sampling is **not** applied at the DaemonSet. Full trace data is forwarded to the Gateway, where tail-sampling decisions are made across the complete trace — consistent with all other agent deployments.
-
-All traces → `DaemonSet → Gateway NLB → Grafana Tempo`.
-
----
-
-### Custom otelcol-contrib Build — Included Components
-
-#### Receivers
-
-| Component | Purpose |
-|-----------|---------|
-| `otlpreceiver` | Receive traces and metrics from app pods via `hostIP:4317/4318` |
-| `hostmetricsreceiver` | Node OS metrics (CPU, mem, disk, net) |
-| `kubeletstatsreceiver` | Per-pod and per-container resource metrics from the Kubelet stats endpoint |
-| `k8sclusterreceiver` | Cluster-level metrics (deployments, pod phases, node conditions, HPA) — leader pod only |
-| `filelogreceiver` | Pod stdout/stderr logs from `/var/log/pods`; node system logs |
-
-#### Processors
-
-| Component | Purpose |
-|-----------|---------|
-| `memorylimiterprocessor` | Prevent OOM under log or trace burst |
-| `batchprocessor` | Batch before forwarding to reduce NLB connection overhead |
-| `resourcedetectionprocessor` | Auto-attach EC2 node metadata (instance ID, region, AZ) and Kubernetes node name |
-| `k8sattributesprocessor` | Enrich spans and log records with pod, namespace, and deployment metadata via K8s API |
-| `attributesprocessor` | Attach static labels: `deployment.environment`, `team`, `cluster.name` from config template vars |
-| `redactionprocessor` | PII scrubbing — strip sensitive fields before export |
-| `filterprocessor` | Drop debug logs (prod), health-check and readiness-probe spans, low-value kubelet metrics |
-
-#### Exporters
-
-| Component | Purpose |
-|-----------|------|
-| `otlpexporter` | Forward all signals (gRPC, TLS) to `nlb.company.com:443` |
-
-#### Extensions
-
-| Component | Purpose |
-|-----------|---------|
-| `healthcheckextension` | `/health` endpoint used as the DaemonSet pod liveness probe |
-| `zpagesextension` | Debug pipeline visibility during rollout |
-| `k8sleaderelector` | Elect one DaemonSet pod to run `k8sclusterreceiver`; all other pods skip it |
-
----
-
-### RBAC Requirements
-
-The DaemonSet ServiceAccount requires a ClusterRole so `k8sattributesprocessor` and `k8sclusterreceiver` can query the Kubernetes API server:
-
-```yaml
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "namespaces", "nodes", "endpoints"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
-    verbs: ["get", "list", "watch"]
-```
-
----
-
-### Deployment Notes
-
-- **`hostPath` mounts**: `/var/log/pods` and `/var/log` must be mounted read-only into the DaemonSet pod for `filelogreceiver` access.
-- **`hostPort`**: The `otlpreceiver` listens on `hostPort: 4317` and `hostPort: 4318` so app pods can reach it via the node IP injected by the Downward API. Using `hostNetwork: true` is an alternative but exposes broader node networking — prefer `hostPort`.
-- **Resource limits**: Set CPU `request: 100m / limit: 500m`, memory `request: 200Mi / limit: 400Mi`. Mark the pod with `priorityClassName: system-node-critical` to reduce eviction risk under node memory pressure.
-- **Config management**: Config stored in a `ConfigMap` and mounted into the DaemonSet pod. Updates are applied via `kubectl rollout restart daemonset/otelcol-contrib` from the same DevOps pipeline used for EC2 agent deployments.
-- **TLS CA cert**: Mount the Gateway NLB CA certificate into the pod from a Kubernetes `Secret` and reference it in the `otlpexporter` TLS stanza.
-- **Tolerations**: Add tolerations for control-plane node taints if node-level metrics from control plane nodes are required.
-- **Node selector**: Scope to Linux nodes only (`kubernetes.io/os: linux`) if Windows node pools are present in the cluster.
+| | OTel SDK (manual) | Auto-instrumentation wrapper |
+|---|---|---|
+| Code changes required | Yes — explicit SDK calls | None |
+| Custom span / metric control | Full | Limited to auto-instrumented libraries |
+| No additional process on host | Yes | Yes |
+| Suitable for short-lived processes | Yes | Yes |
 
 ---
 
@@ -750,6 +820,7 @@ rules:
 | Instance Role | Deployment Count | OS | Signals | Ingest Direction |
 |---------------|-----------------|-----|---------|-----------------|
 | Standard EC2 Host Agent | One per EC2 host | Linux + Windows | Metrics · Logs · Traces | Push → Gateway NLB |
+| ETL Pipelines (Python SDK) | One SDK per pipeline process; shares EC2 host agent | Linux (AWS EC2) | Metrics · Logs · Traces | SDK → Local Agent → Gateway NLB |
 | Remote Collection Scraper | One dedicated instance | Linux | Metrics · Logs | Pull (API) → Push to Gateway NLB |
 | Python Job Instrumentation | One per scheduled job process | Linux | Metrics · Logs · Traces | Push → Gateway NLB |
 | OTel Sidecar | One per ECS task instance | Linux (container) | Metrics · Logs · Traces | Push → Gateway NLB |
